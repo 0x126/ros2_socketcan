@@ -17,6 +17,7 @@
 #include "ros2_socketcan/socket_can_common.hpp"
 #include "ros2_socketcan/socket_can_receiver.hpp"
 
+#include <poll.h>
 #include <unistd.h>  // for close()
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -47,29 +48,30 @@ SocketCanReceiver::~SocketCanReceiver() noexcept
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-void SocketCanReceiver::wait(const std::chrono::nanoseconds timeout) const
-{
-  if (decltype(timeout)::zero() < timeout) {
-    auto c_timeout = to_timeval(timeout);
-    auto read_set = single_set(m_file_descriptor);
-    // Wait
-    if (0 == select(m_file_descriptor + 1, &read_set, NULL, NULL, &c_timeout)) {
-      throw SocketCanTimeout{"CAN Receive Timeout"};
-    }
-    //lint --e{9130, 1924, 9123, 9125, 1924, 9126} NOLINT
-    if (!FD_ISSET(m_file_descriptor, &read_set)) {
-      throw SocketCanTimeout{"CAN Receive timeout"};
-    }
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////
 CanId SocketCanReceiver::receive(void * const data, const std::chrono::nanoseconds timeout) const
 {
-  wait(timeout);
+  // Poll
+  struct pollfd pfds[1];
+  pfds[0].fd = m_file_descriptor;
+  pfds[0].events = POLLIN;
+
+  int nevents = poll(pfds, 1, std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
+  if (nevents < 0) {
+    throw std::runtime_error{strerror(errno)};
+  }
+  if (nevents == 0) {
+    throw SocketCanTimeout{"CAN Receive Timeout"};
+  }
+
   // Read
   struct can_frame frame;
-  const auto nbytes = read(m_file_descriptor, &frame, sizeof(frame));
+  ssize_t nbytes(0);
+  if (pfds[0].revents & POLLIN) {
+    nbytes = recv(pfds[0].fd, &frame, sizeof(frame), 0);
+  }else if ((pfds[0].revents & POLLERR) || (pfds[0].revents & POLLHUP) || (pfds[0].revents & POLLNVAL)) {
+    throw std::runtime_error{"Polling Error"};
+  }
+
   // Checks
   if (nbytes < 0) {
     throw std::runtime_error{strerror(errno)};
@@ -80,6 +82,7 @@ CanId SocketCanReceiver::receive(void * const data, const std::chrono::nanosecon
   if (static_cast<std::size_t>(nbytes) != sizeof(frame)) {
     throw std::logic_error{"Message was wrong size"};
   }
+
   // Write
   const auto data_length = static_cast<CanId::LengthT>(frame.can_dlc);
   (void)std::memcpy(data, static_cast<void *>(&frame.data[0U]), data_length);
